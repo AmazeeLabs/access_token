@@ -1,0 +1,203 @@
+<?php
+
+use Drupal\Component\Utility\Crypt;
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\FieldableEntityInterface;
+use Drupal\Core\Field\EntityReferenceFieldItemListInterface;
+use Drupal\language\Plugin\LanguageNegotiation\LanguageNegotiationContentEntity;
+
+/**
+ * Implements hook_entity_access().
+ */
+function access_token_entity_access(EntityInterface $entity, $operation) {
+  $access_token = \Drupal::request()->get('access_token');
+  if ($operation == 'view' && $access_token) {
+    if ($access_token == access_token_generate_access_token()) {
+      // Access token is only valid for on the canonical entity pages and only
+      // for the entity display
+      $accessed_entity = access_token_get_current_page_entity();
+      if ($accessed_entity->uuid() == $entity->uuid()
+        || access_token_is_referenced_entity($entity, $accessed_entity)) {
+        return AccessResult::allowed()->addCacheContexts(['url.query_args']);
+      }
+    }
+  }
+  return AccessResult::neutral();
+}
+
+/**
+ * Implements hook_entity_view().
+ *
+ * Show link with access token to editors
+ */
+function access_token_entity_view(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display, $view_mode) {
+  $entity_type = $entity->getEntityTypeId();
+  $entity_type_manager = Drupal::entityTypeManager();
+  if ( $entity_type == 'node'
+    && $view_mode == 'full'
+    && !$entity->get('status')->value
+    && ($access_handler = $entity_type_manager->getHandler($entity_type, 'access'))
+    && $access_handler->access($entity, 'update')
+  ) {
+    $url = access_token_get_entity_link_with_token($entity);
+    $link = Drupal::getContainer()->get('link_generator')->generate(t('link'), $url);
+
+    // Create a new element to display the link on top of the content
+    $message = [
+      '#markup' => t('Not authenticated users can see this by visiting this @link', ['@link' => $link]),
+      '#theme_wrappers' => [
+        'container' => [
+          '#attributes' => ['class' => ['access-token-link']]
+        ]
+      ]
+    ];
+
+    // Inject into content
+    $build = ['access_token' => $message] + $build;
+  }
+}
+
+/**
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ * @return $this
+ */
+function access_token_get_entity_link_with_token(EntityInterface $entity) {
+// Generate entity link with access token
+  $link = $entity->toUrl()->setOption('absolute', TRUE);
+  $query = ['access_token' => access_token_generate_access_token($entity)];
+
+  // Drupal 8 language negociation might break this link because of
+  // LanguageNegotiationContentEntity::processOutbound()
+  if (Drupal::moduleHandler()->moduleExists('language')) {
+    $query[LanguageNegotiationContentEntity::QUERY_PARAMETER] = Drupal::languageManager()
+      ->getCurrentLanguage()
+      ->getId();
+  }
+
+  $link->setOption('query', $query);
+  return $link;
+}
+
+/**
+ * Generate the access token for a given entity or current page's entity
+ *
+ * @param \Drupal\Core\Entity\EntityInterface|NULL $entity
+ *  Entity to generate access token for
+ *
+ * @return string
+ */
+function access_token_generate_access_token(EntityInterface $entity = NULL) {
+  if ($entity === NULL) {
+    $entity = access_token_get_current_page_entity();
+  }
+
+  $access_token = '';
+  if ($entity->uuid()) {
+    // generate access token based on a few variables
+    $data = [
+      'route_name' => $entity->toUrl('canonical')->getRouteName(),
+      'parameters' => $entity->toUrl('canonical')->getRouteParameters(),
+      'langcode' => $entity->language()->getId(),
+    ];
+    $access_token = Crypt::hmacBase64(serialize($data), $entity->uuid());
+  }
+
+  return $access_token;
+}
+
+/**
+ * Try to find which entity this page belongs to
+ *
+ * It parses all parameters available for current route and returns the first
+ * parameter that is an entity and has this page as canonical link
+ *
+ * @return Drupal\core\Entity\EntityInterface|NULL
+ *  Entity object or NULL otherwise
+ */
+function access_token_get_current_page_entity() {
+  $entity = &drupal_static(__FUNCTION__, FALSE);
+
+  if ($entity === FALSE) {
+    $route = Drupal::routeMatch();
+    foreach($route->getParameters()->all() as $name => $value) {
+      if ( is_object($value)
+        // Make sure this is an entity
+        && $value instanceof \Drupal\core\Entity\EntityInterface
+        // And this path is the canonical path for this entity type
+        && $route->getRouteName() == $value->toUrl()->getRouteName()
+        // And the route parameters are the same
+        && $route->getRawParameters()->all() === $value->toUrl()->getRouteParameters()
+      ) {
+        $entity = $value;
+      }
+    }
+  }
+
+  // If no entity found stop searching next time this get's called
+  if ($entity == FALSE) {
+    $entity = NULL;
+  }
+
+  return $entity;
+}
+
+/**
+ * Check if $entity is referenced inside $container entity
+ *
+ * @param Drupal\Core\Entity\EntityInterface $entity
+ * @param Drupal\Core\Entity\EntityInterface$container
+ * $param int $recursivity_level
+ *
+ * @return bool
+ *  TRUE if the $container entity has references to $entity or false otherwise
+ */
+function access_token_is_referenced_entity(EntityInterface $entity, EntityInterface $container) {
+  // Get the list with all referenced entities
+  $referenced_uuids = access_token_get_all_referenced_entity_uuids($container);
+
+  // Check if it's in the list
+  return isset($referenced_uuids[$entity->uuid()]);
+}
+
+/**
+ * Get the all entity UUIDs referenced by a given entity
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ *
+ * @return array
+ *  A list with all UUIDs referenced by this entity
+ */
+function access_token_get_all_referenced_entity_uuids(EntityInterface $entity) {
+  // This function get's called many times on a page load with ?access_token
+  static $cache = array();
+  if (!isset($cache['list'])) {
+    $cache['list'] = &drupal_static(__FUNCTION__, array());
+  }
+
+  $uuid = $entity->uuid();
+  if (!isset($cache['list'][$uuid])) {
+    $cache['list'][$uuid] = array();
+
+    // If entity has fields, check them
+    if ($entity instanceof FieldableEntityInterface) {
+      foreach($entity->getFields() as $field_values) {
+        if (!($field_values instanceof EntityReferenceFieldItemListInterface)) {
+          continue; // skip non-reference values
+        }
+
+        // Add all references
+        foreach ($field_values->referencedEntities() as $referencedEntity) {
+          $cache['list'][$uuid][$referencedEntity->uuid()] = 1;
+
+          if ($referencedEntity instanceof FieldableEntityInterface) {
+            $cache['list'][$uuid] += access_token_get_all_referenced_entity_uuids($referencedEntity);
+          }
+        }
+      }
+    }
+  }
+
+  return $cache['list'][$uuid];
+}

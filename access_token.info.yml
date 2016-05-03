@@ -1,0 +1,5 @@
+name: Access Token
+type: module
+description: 'Provide access to unpublished content based on URL access tokens'
+package: Amazee
+core: 8.x
