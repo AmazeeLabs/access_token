@@ -94,7 +94,7 @@ function access_token_generate_access_token(EntityInterface $entity = NULL) {
   }
 
   $access_token = '';
-  if ($entity->uuid()) {
+  if ($entity instanceof EntityInterface && $entity->uuid()) {
     // generate access token based on a few variables
     $data = [
       'route_name' => $entity->toUrl('canonical')->getRouteName(),
@@ -135,7 +135,7 @@ function access_token_get_current_page_entity() {
     }
   }
 
-  // If no entity found stop searching next time this get's called
+  // If no entity found stop searching next time this gets called
   if ($entity == FALSE) {
     $entity = NULL;
   }
@@ -148,7 +148,6 @@ function access_token_get_current_page_entity() {
  *
  * @param Drupal\Core\Entity\EntityInterface $entity
  * @param Drupal\Core\Entity\EntityInterface$container
- * $param int $recursivity_level
  *
  * @return bool
  *  TRUE if the $container entity has references to $entity or false otherwise
